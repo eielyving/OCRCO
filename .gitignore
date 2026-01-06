@@ -1,0 +1,24 @@
+# Python 编译缓存
+__pycache__/
+*.py[cod]
+
+# 打包生成的临时文件和成品
+build/
+dist/
+*.spec
+# 注意：如果你想保留 .spec 配置，就把上面这行 *.spec 删掉，我建议你保留
+
+# 临时图片
+temp_ocr.png
+
+# 具体的 exe 文件
+*.exe
+# 但是排除 wechatocr 引擎里的 exe (让它可以通过)
+!ocr_engine/*.exe
+
+# 编辑器配置 (如果你用 VSCode 或 PyCharm)
+.vscode/
+.idea/
+
+# 备份文件
+*.bak
