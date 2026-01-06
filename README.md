@@ -16,7 +16,7 @@ OCRCO 是一款基于 **Python + PyQt6** 开发的轻量级 Windows 桌面 OCR �
 * **👁️ 视觉体验**：高清截图预览，UI 自动缩放，支持高 DPI 屏幕。
 
 
-`![软件截图](screenshot.png)`
+![screenshot.png](https://raw.githubusercontent.com/eielyving/OCRCO/refs/heads/main/screenshot.png)
 ---
 
 ## 🛠️ 安装与运行 (Installation)
