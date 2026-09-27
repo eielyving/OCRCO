@@ -1,5 +1,6 @@
 import sys
 import os
+import subprocess
 import threading
 import requests
 import json
@@ -35,7 +36,13 @@ OPENAI_API_KEY = ""
 OPENAI_MODEL = "gpt-3.5-turbo"
 APP_NAME = "OCRCO"
 
-# --- 环境设置 ---
+# --- 工作目录与环境设置 ---
+if getattr(sys, 'frozen', False):
+    APP_ROOT = os.path.dirname(sys.executable)
+else:
+    APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+os.chdir(APP_ROOT)
+
 os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "0"
 QGuiApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
 
@@ -658,22 +665,40 @@ class ResultWindow(QWidget):
         else: super().keyPressEvent(event)
     def closeEvent(self, event):
         self.enter_light_mode(); event.ignore()
-    def get_run_key(self):
-        return winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_ALL_ACCESS)
+    @staticmethod
+    def get_startup_shortcut_path():
+        appdata = os.environ.get('APPDATA', '')
+        if not appdata:
+            return ""
+        return os.path.join(appdata, r"Microsoft\Windows\Start Menu\Programs\Startup", f"{APP_NAME}.lnk")
 
-    def get_app_cmd(self):
+    def get_run_key(self, write=False):
+        access = winreg.KEY_ALL_ACCESS if write else winreg.KEY_READ
+        return winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, access)
+
+    def get_app_paths(self):
         if getattr(sys, 'frozen', False):
-            return f'"{sys.executable}"'
+            exe_path = sys.executable
+            work_dir = os.path.dirname(exe_path)
+            cmd = f'"{exe_path}"'
         else:
             main_script = os.path.abspath(__file__)
+            work_dir = os.path.dirname(main_script)
             py_exe = sys.executable
             pyw_exe = os.path.join(os.path.dirname(py_exe), "pythonw.exe")
             exe_to_use = pyw_exe if os.path.exists(pyw_exe) else py_exe
-            return f'"{exe_to_use}" "{main_script}"'
+            cmd = f'"{exe_to_use}" "{main_script}"'
+            exe_path = exe_to_use
+        return exe_path, work_dir, cmd
 
     def check_autostart_status(self):
+        # 1. 优先检查启动文件夹快捷方式
+        lnk_path = self.get_startup_shortcut_path()
+        if lnk_path and os.path.exists(lnk_path):
+            return True
+        # 2. 检查注册表 Run 项
         try:
-            key = self.get_run_key()
+            key = self.get_run_key(write=False)
             winreg.QueryValueEx(key, APP_NAME)
             winreg.CloseKey(key)
             return True
@@ -681,21 +706,59 @@ class ResultWindow(QWidget):
             return False
 
     def toggle_autostart(self):
-        try:
-            key = self.get_run_key()
-            if self.autostart_action.isChecked():
-                cmd = self.get_app_cmd()
-                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, cmd)
-                self.tray_icon.showMessage("OCRCO", "已开启开机自启动", QSystemTrayIcon.MessageIcon.Information, 1000)
-            else:
+        is_checked = self.autostart_action.isChecked()
+        lnk_path = self.get_startup_shortcut_path()
+        exe_path, work_dir, cmd = self.get_app_paths()
+
+        if is_checked:
+            # 开启开机自启（双保险：Windows启动文件夹快捷方式 + 注册表Run项）
+            # A. 启动文件夹快捷方式（最稳定可靠，免除安全软件误拦截）
+            if lnk_path:
                 try:
-                    winreg.DeleteValue(key, APP_NAME)
+                    ps_cmd = (
+                        f"$w = New-Object -ComObject WScript.Shell;"
+                        f"$s = $w.CreateShortcut('{lnk_path}');"
+                        f"$s.TargetPath = '{exe_path}';"
+                        f"$s.WorkingDirectory = '{work_dir}';"
+                        f"$s.Description = '{APP_NAME} - 智能截图识别';"
+                    )
+                    if not getattr(sys, 'frozen', False):
+                        main_script = os.path.abspath(__file__)
+                        ps_cmd += f"$s.Arguments = '\"{main_script}\"';"
+                    ps_cmd += "$s.Save()"
+                    subprocess.run(
+                        ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_cmd],
+                        capture_output=True,
+                        creationflags=0x08000000 if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+                    )
+                except Exception as e:
+                    print(f"[WARN] 创建自启快捷方式失败: {e}")
+
+            # B. 注册表 Run 项
+            try:
+                key = self.get_run_key(write=True)
+                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, cmd)
+                winreg.CloseKey(key)
+            except Exception as e:
+                print(f"[WARN] 写入注册表自启失败: {e}")
+
+            self.tray_icon.showMessage("OCRCO", "已开启开机自启动！\n（已加入 Windows 启动项）", QSystemTrayIcon.MessageIcon.Information, 1500)
+        else:
+            # 关闭自启动
+            if lnk_path and os.path.exists(lnk_path):
+                try:
+                    os.remove(lnk_path)
                 except Exception:
                     pass
-                self.tray_icon.showMessage("OCRCO", "已关闭开机自启动", QSystemTrayIcon.MessageIcon.Information, 1000)
-            winreg.CloseKey(key)
-        except Exception as e:
-            print(f"[WARN] toggle_autostart error: {e}")
+
+            try:
+                key = self.get_run_key(write=True)
+                winreg.DeleteValue(key, APP_NAME)
+                winreg.CloseKey(key)
+            except Exception:
+                pass
+
+            self.tray_icon.showMessage("OCRCO", "已关闭开机自启动", QSystemTrayIcon.MessageIcon.Information, 1000)
     def show_window(self):
         self.showNormal(); self.activateWindow(); self.setFocus()
     def quit_app(self): QApplication.quit()
@@ -2052,7 +2115,14 @@ class ScreenshotSelector(QWidget):
         self.hide()
 
 if __name__ == "__main__":
+    # 单实例运行锁：防止多次启动导致热键冲突或托盘重复
+    mutex = ctypes.windll.kernel32.CreateMutexW(None, False, f"Global\\{APP_NAME}_SingleInstance_Mutex")
+    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        print(f"[INFO] {APP_NAME} 已经在运行中，请勿重复启动。")
+        sys.exit(0)
+
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
     if os.path.exists(ICON_PATH):
         app.setWindowIcon(QIcon(ICON_PATH))
     
