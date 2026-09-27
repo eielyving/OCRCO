@@ -8,6 +8,8 @@ import re
 import gc 
 import winreg 
 import ctypes
+import socket
+import urllib.parse
 from ctypes import wintypes
 import math
 import numpy as np
@@ -411,6 +413,177 @@ class LayoutFormatter:
         </div>
         '''
 
+class TranslationService:
+    """
+    多引擎高可用翻译服务：
+    1. 在线首选：Google Chrome 扩展 API (超高限流上限，极少 429)
+    2. 在线备用 1：Google GTX Web API (浏览器级伪装 Headers)
+    3. 在线备用 2：MyMemory 开放翻译 API
+    4. 离线兜底 / 局域网断网保底：本地 Ollama 大模型 (如 qwen2.5:7b / qwen2.5:latest)，100% 本地运行无需外网
+    """
+    HEADERS = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
+    }
+
+    @staticmethod
+    def is_online(timeout=0.8):
+        for host in [('223.5.5.5', 53), ('119.29.29.29', 53), ('1.1.1.1', 53)]:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(timeout)
+                s.connect(host)
+                s.close()
+                return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
+    def get_ollama_model():
+        try:
+            r = requests.get('http://127.0.0.1:11434/api/tags', timeout=0.8)
+            if r.status_code == 200:
+                models = [m.get('name', '') for m in r.json().get('models', [])]
+                for preferred in ['qwen2.5:7b', 'qwen2.5:latest', 'qwen2.5', 'llama3', 'gemma2']:
+                    for m in models:
+                        if preferred in m:
+                            return m
+                if models:
+                    return models[0]
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    def translate_google_chrome(cls, text, to_lang='zh-CN'):
+        url = 'https://clients5.google.com/translate_a/t'
+        params = {'client': 'dict-chrome-ex', 'sl': 'auto', 'tl': to_lang}
+        r = requests.post(url, params=params, data={'q': text}, headers=cls.HEADERS, timeout=4)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list) and len(data) > 0:
+                if isinstance(data[0], list):
+                    return data[0][0]
+                return data[0]
+        raise Exception(f'Google Chrome API code {r.status_code}')
+
+    @classmethod
+    def translate_google_gtx(cls, text, to_lang='zh-CN'):
+        url = 'https://translate.googleapis.com/translate_a/single'
+        params = {'client': 'gtx', 'sl': 'auto', 'tl': to_lang, 'dt': 't'}
+        r = requests.post(url, params=params, data={'q': text}, headers=cls.HEADERS, timeout=4)
+        if r.status_code == 200:
+            data = r.json()
+            return ''.join([x[0] for x in data[0] if x and len(x) > 0 and x[0]])
+        raise Exception(f'Google GTX API code {r.status_code}')
+
+    @classmethod
+    def translate_mymemory(cls, text, to_lang='zh-CN'):
+        url = 'https://api.mymemory.translated.net/get'
+        params = {'q': text[:500], 'langpair': f'auto|{to_lang}'}
+        r = requests.get(url, params=params, headers=cls.HEADERS, timeout=4)
+        if r.status_code == 200:
+            res = r.json().get('responseData', {}).get('translatedText')
+            if res:
+                return res
+        raise Exception('MyMemory API failed')
+
+    @classmethod
+    def translate_ollama(cls, text, to_lang='zh-CN', model=None):
+        if not model:
+            model = cls.get_ollama_model()
+        if not model:
+            raise Exception('未检测到本地 Ollama 模型')
+        
+        target_name = 'Simplified Chinese' if to_lang == 'zh-CN' else 'English'
+        prompt = (
+            f"Translate the following text into {target_name}. "
+            "Preserve line breaks and separators ' ||| '. "
+            "Output ONLY the direct translation, without any explanation, markdown formatting or quotes:\n\n"
+            f"{text}"
+        )
+        r = requests.post('http://127.0.0.1:11434/api/generate', json={
+            'model': model,
+            'prompt': prompt,
+            'stream': False,
+            'options': {'temperature': 0.1}
+        }, timeout=15)
+        if r.status_code == 200:
+            return r.json().get('response', '').strip()
+        raise Exception(f'Ollama API code {r.status_code}')
+
+    @classmethod
+    def _translate_chunk(cls, chunk, to_lang):
+        joint_text = ' ||| '.join(chunk)
+        online = cls.is_online(timeout=0.8)
+        engine_used = ''
+        translated_str = ''
+
+        # 1. 在线通道优先尝试
+        if online:
+            for engine_name, engine_func in [
+                ('Google Chrome', cls.translate_google_chrome),
+                ('Google GTX', cls.translate_google_gtx),
+                ('MyMemory', cls.translate_mymemory)
+            ]:
+                try:
+                    translated_str = engine_func(joint_text, to_lang)
+                    if translated_str:
+                        engine_used = engine_name
+                        break
+                except Exception:
+                    continue
+
+        # 2. 离线/在线失败时，自动调度本地 Ollama 模型
+        if not translated_str:
+            try:
+                ollama_model = cls.get_ollama_model()
+                if ollama_model:
+                    translated_str = cls.translate_ollama(joint_text, to_lang, ollama_model)
+                    engine_used = f'本地离线大模型 ({ollama_model})'
+            except Exception:
+                pass
+
+        if not translated_str:
+            if not online:
+                raise Exception('网络已断开（离线模式），且未检测到运行中的本地 Ollama 模型。\n已为您保留原始识别文字。')
+            else:
+                raise Exception('在线翻译接口均受限/超时(429)，且本地未启动 Ollama 模型。\n已为您保留原始识别文字。')
+
+        parts = [p.strip() for p in re.split(r'\s*\|\|\|\s*', translated_str)]
+        results = []
+        for i in range(len(chunk)):
+            if i < len(parts) and parts[i]:
+                results.append(parts[i])
+            else:
+                results.append(chunk[i])
+        return results, engine_used
+
+    @classmethod
+    def translate_texts(cls, texts, to_lang=None):
+        if not texts:
+            return [], '空文本'
+        
+        joint_source = ' '.join(texts)
+        if not to_lang:
+            chinese_chars = len(re.findall(r'[\u4e00-\u9fa5]', joint_source))
+            total_alpha = len(re.findall(r'[a-zA-Z\u4e00-\u9fa5]', joint_source))
+            to_lang = 'en' if (total_alpha > 0 and (chinese_chars / total_alpha) > 0.4) else 'zh-CN'
+
+        batch_size = 25
+        all_results = []
+        last_engine = ''
+
+        for i in range(0, len(texts), batch_size):
+            chunk = texts[i:i + batch_size]
+            chunk_results, engine_used = cls._translate_chunk(chunk, to_lang)
+            all_results.extend(chunk_results)
+            last_engine = engine_used
+
+        return all_results, last_engine
+
 class ResultWindow(QWidget):
     def __init__(self, ocr_manager, signaler):
         print("[DEBUG] 1. ResultWindow 开始初始化...") 
@@ -459,6 +632,10 @@ class ResultWindow(QWidget):
 
         self.current_format_mode = 'smart'
         self.current_plain_text = ""
+        self.has_translation = False
+        self.translated_blocks_cache = []
+        self.current_text_lang = 'source'
+        self.translated_pixmap = None
         self.setup_ui()
         self.current_pixmap = None
         self.current_ocr_data = [] 
@@ -528,6 +705,30 @@ class ResultWindow(QWidget):
                 color: #ffffff;
                 font-weight: bold;
             }
+            QPushButton.langBtn {
+                background-color: rgba(255, 255, 255, 0.18);
+                border: 1px solid rgba(255, 255, 255, 0.25);
+                border-radius: 6px;
+                color: #e0e0e0;
+                font-size: 13px;
+                padding: 6px 10px;
+                font-weight: normal;
+            }
+            QPushButton.langBtn:hover {
+                background-color: rgba(255, 255, 255, 0.35);
+                color: #ffffff;
+            }
+            QPushButton.langBtn:checked {
+                background-color: #722ed1;
+                border: 1px solid #9254de;
+                color: #ffffff;
+                font-weight: bold;
+            }
+            QPushButton.langBtn:disabled {
+                background-color: rgba(255, 255, 255, 0.05);
+                color: rgba(255, 255, 255, 0.25);
+                border-color: rgba(255, 255, 255, 0.1);
+            }
             QPushButton#copyTextBtn {
                 background-color: #07c160;
                 border: none;
@@ -592,10 +793,33 @@ class ResultWindow(QWidget):
         self.mode_group.addButton(self.btn_mode_raw)
         self.mode_group.addButton(self.btn_mode_md)
 
+        self.view_lang_group = QButtonGroup(self)
+        self.view_lang_group.setExclusive(True)
+
+        self.btn_lang_src = QPushButton("原文")
+        self.btn_lang_src.setProperty("class", "langBtn")
+        self.btn_lang_src.setCheckable(True)
+        self.btn_lang_src.setChecked(True)
+        self.btn_lang_src.setToolTip("查看识别原文")
+        self.btn_lang_src.clicked.connect(lambda: self.switch_text_lang('source'))
+
+        self.btn_lang_trans = QPushButton("译文")
+        self.btn_lang_trans.setProperty("class", "langBtn")
+        self.btn_lang_trans.setCheckable(True)
+        self.btn_lang_trans.setEnabled(False)
+        self.btn_lang_trans.setToolTip("查看翻译译文")
+        self.btn_lang_trans.clicked.connect(lambda: self.switch_text_lang('trans'))
+
+        self.view_lang_group.addButton(self.btn_lang_src)
+        self.view_lang_group.addButton(self.btn_lang_trans)
+
         mode_layout.addWidget(self.btn_mode_smart)
         mode_layout.addWidget(self.btn_mode_para)
         mode_layout.addWidget(self.btn_mode_raw)
         mode_layout.addWidget(self.btn_mode_md)
+        mode_layout.addSpacing(6)
+        mode_layout.addWidget(self.btn_lang_src)
+        mode_layout.addWidget(self.btn_lang_trans)
         mode_layout.addStretch()
 
         self.copy_text_btn = QPushButton("📋 复制文字")
@@ -652,6 +876,16 @@ class ResultWindow(QWidget):
         self.current_plain_text = ""
         self.current_format_mode = 'smart'
         self.btn_mode_smart.setChecked(True)
+        self.has_translation = False
+        self.translated_blocks_cache = []
+        self.translated_pixmap = None
+        self.current_text_lang = 'source'
+        if hasattr(self, 'btn_lang_src'):
+            self.btn_lang_src.setChecked(True)
+            self.btn_lang_trans.setEnabled(False)
+        if hasattr(self, 'trans_btn'):
+            self.trans_btn.setText("🌐 图片翻译")
+            self.trans_btn.setEnabled(True)
         
         if self.selector:
             self.selector.clear_memory()
@@ -769,10 +1003,21 @@ class ResultWindow(QWidget):
         self.current_pixmap = pixmap
         self.image_label.set_custom_pixmap(pixmap)
         
+        self.trans_image_label.clear_canvas()
         self.trans_image_label.hide()
         self.text_edit.show()
         self.text_edit.setHtml("")
         self.text_edit.setPlaceholderText("正在识别中...")
+        self.has_translation = False
+        self.translated_blocks_cache = []
+        self.translated_pixmap = None
+        self.current_text_lang = 'source'
+        if hasattr(self, 'btn_lang_src'):
+            self.btn_lang_src.setChecked(True)
+            self.btn_lang_trans.setEnabled(False)
+        if hasattr(self, 'trans_btn'):
+            self.trans_btn.setText("🌐 图片翻译")
+            self.trans_btn.setEnabled(True)
         self.show_window()
         
         target_ocr_pixmap = clean_pixmap if (clean_pixmap and not clean_pixmap.isNull()) else pixmap
@@ -811,22 +1056,42 @@ class ResultWindow(QWidget):
             self.apply_current_format()
             return
         elif text.startswith("PAINT_OVERLAY"):
-            self.paint_translation_overlay(text.replace("PAINT_OVERLAY", ""))
+            engine_info = text.split(":", 1)[1] if ":" in text else ""
+            self.paint_translation_overlay(engine_info)
+            return
+        elif text.startswith("TRANSLATE_FAILED:"):
+            error_msg = text.split(":", 1)[1]
+            self.handle_translation_failed(error_msg)
             return
         self.update_text(text)
 
     def switch_format_mode(self, mode):
         self.current_format_mode = mode
+        if self.trans_image_label.isVisible():
+            self.trans_image_label.hide()
+            self.text_edit.show()
+            if self.has_translation:
+                self.trans_btn.setText("🌐 查看翻译图片")
+        self.apply_current_format()
+
+    def switch_text_lang(self, lang):
+        self.current_text_lang = lang
+        if self.trans_image_label.isVisible():
+            self.trans_image_label.hide()
+            self.text_edit.show()
+            if self.has_translation:
+                self.trans_btn.setText("🌐 查看翻译图片")
         self.apply_current_format()
 
     def apply_current_format(self):
-        if not self.current_ocr_data:
+        target_blocks = self.translated_blocks_cache if (self.current_text_lang == 'trans' and self.translated_blocks_cache) else self.current_ocr_data
+        if not target_blocks:
             self.text_edit.setHtml("")
             self.text_edit.setPlaceholderText("未识别到文字 (已过滤杂讯)")
             return
 
         plain_text, html_content = LayoutFormatter.format_blocks(
-            self.current_ocr_data,
+            target_blocks,
             mode=self.current_format_mode
         )
         self.current_plain_text = plain_text
@@ -838,7 +1103,8 @@ class ResultWindow(QWidget):
     def copy_text_action(self):
         if self.current_plain_text:
             QApplication.clipboard().setText(self.current_plain_text)
-            self.tray_icon.showMessage("OCRCO", "文字排版已复制到剪贴板！", QSystemTrayIcon.MessageIcon.Information, 800)
+            lang_label = "译文" if (self.current_text_lang == 'trans' and self.has_translation) else "原文"
+            self.tray_icon.showMessage("OCRCO", f"{lang_label}排版已复制到剪贴板！", QSystemTrayIcon.MessageIcon.Information, 800)
 
     def update_text(self, text):
         if not text:
@@ -877,13 +1143,24 @@ class ResultWindow(QWidget):
             if path: target_pixmap.save(path)
 
     def translate_overlay_action(self):
-        if not self.current_ocr_data:
-            self.text_edit.append("\n没有可用于定位的文字信息，无法进行图片翻译。")
+        # 如果已经生成过翻译，点击按钮直接在【翻译图片】和【文字排版】之间切换
+        if self.has_translation and self.translated_pixmap:
+            if self.trans_image_label.isVisible():
+                self.trans_image_label.hide()
+                self.text_edit.show()
+                self.trans_btn.setText("🌐 查看翻译图片")
+            else:
+                self.text_edit.hide()
+                self.trans_image_label.show()
+                self.trans_btn.setText("📝 查看排版文字")
             return
 
-        self.text_edit.setPlaceholderText("正在进行图片级翻译与渲染...")
-        self.text_edit.clear()
-        
+        if not self.current_ocr_data:
+            self.tray_icon.showMessage("OCRCO", "没有识别到有效文字，无法进行翻译", QSystemTrayIcon.MessageIcon.Warning, 1500)
+            return
+
+        self.trans_btn.setText("⏳ 正在翻译中...")
+        self.trans_btn.setEnabled(False)
         threading.Thread(target=self.do_translate_overlay_thread, daemon=True).start()
 
     def do_translate_overlay_thread(self):
@@ -899,40 +1176,34 @@ class ResultWindow(QWidget):
                     valid_blocks.append(block)
             
             if not texts_to_trans:
-                self.signaler.result_ready.emit("未检测到有效坐标文本")
+                self.signaler.result_ready.emit("TRANSLATE_FAILED:未检测到有效坐标文本")
                 return
 
-            joint_text = " ||| ".join(texts_to_trans)
-            url = "https://translate.googleapis.com/translate_a/single"
-            params = {"client": "gtx", "sl": "auto", "tl": "zh-CN", "dt": "t", "q": joint_text}
-            
-            resp = requests.get(url, params=params, timeout=10)
-            translated_results = []
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                full_trans = "".join([x[0] for x in data[0]])
-                translated_results = full_trans.split("|||")
-            else:
-                self.signaler.result_ready.emit(f"翻译接口出错: {resp.status_code}")
-                return
+            translated_results, engine_used = TranslationService.translate_texts(texts_to_trans)
 
             self.translated_blocks_cache = []
             for i, block in enumerate(valid_blocks):
-                if i < len(translated_results):
-                    trans_text = translated_results[i].strip()
-                    self.translated_blocks_cache.append({
-                        'rect': block['location'],
-                        'text': trans_text
-                    })
+                trans_text = translated_results[i].strip() if i < len(translated_results) else block.get('text', '')
+                self.translated_blocks_cache.append({
+                    'location': block.get('location', {}),
+                    'text': trans_text
+                })
             
-            self.signaler.result_ready.emit("PAINT_OVERLAY")
+            self.signaler.result_ready.emit(f"PAINT_OVERLAY:{engine_used}")
 
         except Exception as e:
-            self.signaler.result_ready.emit(f"翻译处理异常: {e}")
+            self.signaler.result_ready.emit(f"TRANSLATE_FAILED:{e}")
 
-    def paint_translation_overlay(self, _):
-        if not self.current_pixmap: return
+    def handle_translation_failed(self, error_msg):
+        self.trans_btn.setText("🌐 图片翻译")
+        self.trans_btn.setEnabled(True)
+        self.tray_icon.showMessage("翻译未完成", error_msg, QSystemTrayIcon.MessageIcon.Warning, 4500)
+
+    def paint_translation_overlay(self, engine_info=""):
+        if not self.current_pixmap:
+            self.trans_btn.setText("🌐 图片翻译")
+            self.trans_btn.setEnabled(True)
+            return
         
         new_pixmap = self.current_pixmap.copy()
         painter = QPainter(new_pixmap)
@@ -946,8 +1217,10 @@ class ResultWindow(QWidget):
         base_font = QFont("Microsoft YaHei", 10, QFont.Weight.Bold)
         
         for item in self.translated_blocks_cache:
-            loc = item.get('rect') or {}
+            loc = item.get('location') or item.get('rect') or {}
             text = item.get('text', '')
+            if not text:
+                continue
             
             x = int(safe_float(loc.get('left'), 0))
             y = int(safe_float(loc.get('top'), 0))
@@ -964,8 +1237,8 @@ class ResultWindow(QWidget):
             
             bg_rect = QRect(bg_x, bg_y, bg_w, bg_h)
             
-            sample_x = max(0, x - 5)
-            sample_y = max(0, y + h // 2) 
+            sample_x = max(0, min(img_w - 1, x - 5))
+            sample_y = max(0, min(img_h - 1, y + h // 2)) 
             bg_color = src_image.pixelColor(sample_x, sample_y)
             
             painter.fillRect(bg_rect, bg_color)
@@ -994,9 +1267,18 @@ class ResultWindow(QWidget):
             painter.drawText(draw_rect, Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, text)
             
         painter.end()
-        self.text_edit.hide()
+        self.translated_pixmap = new_pixmap
         self.trans_image_label.set_custom_pixmap(new_pixmap)
+        self.text_edit.hide()
         self.trans_image_label.show()
+
+        self.has_translation = True
+        self.btn_lang_trans.setEnabled(True)
+        self.trans_btn.setText("📝 查看排版文字")
+        self.trans_btn.setEnabled(True)
+
+        info_str = f"({engine_info})" if engine_info else ""
+        self.tray_icon.showMessage("OCRCO", f"翻译完成 {info_str}！\n可点击按钮在【翻译图片】与【文字排版】间自由切换", QSystemTrayIcon.MessageIcon.Information, 2500)
 
 class ColorButton(QPushButton):
     def __init__(self, color_hex, is_selected=False, parent=None):
