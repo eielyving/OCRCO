@@ -148,17 +148,25 @@ def merge_text_lines(line1, line2):
 
 def should_merge_lines(prev_it, cur_it, avg_h):
     gap = cur_it['top'] - prev_it['bottom']
-    if gap > avg_h * 0.85:
+    if gap > avg_h * 0.95:
         return False
     prev_txt = prev_it['text'].strip()
     cur_txt = cur_it['text'].strip()
     if not prev_txt or not cur_txt:
         return False
-    if abs(cur_it['left'] - prev_it['left']) > avg_h * 1.5:
+    # 首行缩进过大或属于独立栏目则不合并
+    if abs(cur_it['left'] - prev_it['left']) > avg_h * 2.0:
         return False
+    # 序号、列表符开头视为新项目
     if re.match(r'^((\d+[\.\、\)])|([一二三四五六七八九十]+[\.\、\)])|([•\-\*\+]))', cur_txt):
         return False
-    if prev_txt[-1] in ('。', '！', '？', '；', ':', '：', ';', '{', '}'):
+    # 冒号、大括号结尾通常为标题或代码结构
+    if prev_txt[-1] in (':', '：', '{', '}'):
+        return False
+    # 句号/问号结尾且后续行明显缩进或垂直间距较大
+    if prev_txt[-1] in ('。', '！', '？', '.', '!', '?') and (cur_it['left'] - prev_it['left']) > avg_h * 0.8:
+        return False
+    if prev_txt[-1] in ('。', '！', '？') and gap > avg_h * 0.65:
         return False
     return True
 
@@ -189,6 +197,144 @@ class LayoutFormatter:
             raw_lines = [str(b.get('text', '')).strip() for b in raw_blocks if isinstance(b, dict) and b.get('text')]
             fallback_text = '\n'.join([l for l in raw_lines if l])
             return fallback_text, cls.to_html_plain(fallback_text)
+
+    @classmethod
+    def extract_paragraphs(cls, raw_blocks):
+        """
+        按阅读顺序和排版结构聚合成语义完整的自然段落。
+        解决断行截断导致的逐词硬翻译、语序混乱问题。
+        返回包含完整文本、外接矩形、行数据及对齐方式的段落对象列表。
+        """
+        items = []
+        for b in raw_blocks:
+            if not isinstance(b, dict):
+                continue
+            loc = b.get('location')
+            if not isinstance(loc, dict):
+                loc = {}
+            t = safe_float(loc.get('top'), 0.0)
+            bt = safe_float(loc.get('bottom'), 0.0)
+            l = safe_float(loc.get('left'), 0.0)
+            r = safe_float(loc.get('right'), 0.0)
+            txt = str(b.get('text', '')).strip()
+            if txt and (r - l) > 0 and (bt - t) > 0:
+                items.append({
+                    'left': l, 'right': r, 'top': t, 'bottom': bt,
+                    'height': max(1.0, bt - t), 'width': max(1.0, r - l),
+                    'cy': (t + bt) / 2, 'cx': (l + r) / 2,
+                    'text': txt
+                })
+
+        if not items:
+            return []
+
+        avg_h = sum(it['height'] for it in items) / len(items)
+        if avg_h <= 0:
+            avg_h = 16.0
+
+        min_x = max(0.0, min(it['left'] for it in items))
+        max_x = max(min_x + 10.0, max(it['right'] for it in items))
+        w_span = min(20000, int(max_x) + 15)
+        occupied = [0] * max(1, w_span)
+        for it in items:
+            start_x = max(0, min(w_span - 1, int(it['left'])))
+            end_x = max(start_x, min(w_span, int(it['right'])))
+            for x in range(start_x, end_x):
+                occupied[x] += 1
+
+        gutters = []
+        in_gap = False
+        gap_start = 0
+        min_gap_width = max(8, int(avg_h * 0.5))
+        for x in range(int(min_x), min(w_span, int(max_x))):
+            if occupied[x] == 0:
+                if not in_gap:
+                    in_gap = True
+                    gap_start = x
+            else:
+                if in_gap:
+                    in_gap = False
+                    if (x - gap_start) >= min_gap_width:
+                        gutters.append((gap_start, x, (gap_start + x) / 2))
+
+        is_multi_column = False
+        split_x_list = []
+        if gutters:
+            valid_splits = []
+            for g_start, g_end, split_x in gutters:
+                left_count = sum(1 for it in items if it['right'] <= split_x)
+                right_count = sum(1 for it in items if it['left'] >= split_x)
+                if left_count >= 2 and right_count >= 2:
+                    valid_splits.append(split_x)
+            if valid_splits:
+                is_multi_column = True
+                split_x_list = valid_splits
+
+        def build_para_obj(para_lines):
+            merged = para_lines[0]['text']
+            for it in para_lines[1:]:
+                merged = merge_text_lines(merged, it['text'])
+            min_l = min(x['left'] for x in para_lines)
+            min_t = min(x['top'] for x in para_lines)
+            max_r = max(x['right'] for x in para_lines)
+            max_b = max(x['bottom'] for x in para_lines)
+            lefts = [x['left'] for x in para_lines]
+            cxs = [x['cx'] for x in para_lines]
+            is_centered = len(para_lines) > 1 and (max(cxs) - min(cxs) < 15) and (max(lefts) - min(lefts) > 20)
+            return {
+                'text': merged,
+                'lines': para_lines,
+                'location': {'left': min_l, 'top': min_t, 'right': max_r, 'bottom': max_b},
+                'avg_height': sum(x['height'] for x in para_lines) / len(para_lines),
+                'align': 'center' if is_centered else 'left'
+            }
+
+        paragraphs = []
+        if is_multi_column:
+            def get_col(it):
+                for idx, sx in enumerate(split_x_list):
+                    if it['cx'] < sx:
+                        return idx
+                return len(split_x_list)
+
+            for it in items:
+                it['col'] = get_col(it)
+
+            num_cols = len(split_x_list) + 1
+            for c in range(num_cols):
+                c_items = [it for it in items if it['col'] == c]
+                c_items.sort(key=lambda x: (round(x['top'] / (avg_h * 0.8)), x['left']))
+                cur_para = []
+                for it in c_items:
+                    if not cur_para:
+                        cur_para.append(it)
+                    else:
+                        prev = cur_para[-1]
+                        if should_merge_lines(prev, it, avg_h):
+                            cur_para.append(it)
+                        else:
+                            paragraphs.append(build_para_obj(cur_para))
+                            cur_para = [it]
+                if cur_para:
+                    paragraphs.append(build_para_obj(cur_para))
+            paragraphs.sort(key=lambda p: (round(p['location']['top'] / (avg_h * 1.2)), p['location']['left']))
+        else:
+            items.sort(key=lambda x: (round(x['top'] / (avg_h * 0.8)), x['left']))
+            cur_para = []
+            for it in items:
+                if not cur_para:
+                    cur_para.append(it)
+                else:
+                    prev = cur_para[-1]
+                    if should_merge_lines(prev, it, avg_h):
+                        cur_para.append(it)
+                    else:
+                        paragraphs.append(build_para_obj(cur_para))
+                        cur_para = [it]
+            if cur_para:
+                paragraphs.append(build_para_obj(cur_para))
+
+        return paragraphs
 
     @classmethod
     def _format_blocks_impl(cls, raw_blocks, mode='smart'):
@@ -353,31 +499,8 @@ class LayoutFormatter:
                 return plain_res, html_res
 
         else:
-            items.sort(key=lambda x: (round(x['top'] / (avg_h * 0.8)), x['left']))
-            
-            paragraphs = []
-            current_para = []
-            for it in items:
-                if not current_para:
-                    current_para.append(it)
-                else:
-                    prev = current_para[-1]
-                    if should_merge_lines(prev, it, avg_h):
-                        current_para.append(it)
-                    else:
-                        paragraphs.append(current_para)
-                        current_para = [it]
-                        
-            if current_para:
-                paragraphs.append(current_para)
-                
-            para_texts = []
-            for p in paragraphs:
-                merged = p[0]['text']
-                for it in p[1:]:
-                    merged = merge_text_lines(merged, it['text'])
-                para_texts.append(merged)
-                
+            paragraphs = cls.extract_paragraphs(raw_blocks)
+            para_texts = [p['text'] for p in paragraphs]
             plain_res = '\n\n'.join(para_texts)
             html_res = cls.to_html_paragraphs(para_texts)
             return plain_res, html_res
@@ -553,6 +676,32 @@ class TranslationService:
                 raise Exception('在线翻译接口均受限/超时(429)，且本地未启动 Ollama 模型。\n已为您保留原始识别文字。')
 
         parts = [p.strip() for p in re.split(r'\s*\|\|\|\s*', translated_str)]
+        if len(parts) != len(chunk) and len(chunk) > 1:
+            results = []
+            for item in chunk:
+                item_str = ''
+                if online:
+                    for engine_name, engine_func in [
+                        ('Google Chrome', cls.translate_google_chrome),
+                        ('Google GTX', cls.translate_google_gtx),
+                        ('MyMemory', cls.translate_mymemory)
+                    ]:
+                        try:
+                            item_str = engine_func(item, to_lang)
+                            if item_str:
+                                break
+                        except Exception:
+                            continue
+                if not item_str:
+                    try:
+                        ollama_model = cls.get_ollama_model()
+                        if ollama_model:
+                            item_str = cls.translate_ollama(item, to_lang, ollama_model)
+                    except Exception:
+                        pass
+                results.append(item_str.strip() if item_str else item)
+            return results, engine_used
+
         results = []
         for i in range(len(chunk)):
             if i < len(parts) and parts[i]:
@@ -1084,14 +1233,36 @@ class ResultWindow(QWidget):
         self.apply_current_format()
 
     def apply_current_format(self):
-        target_blocks = self.translated_blocks_cache if (self.current_text_lang == 'trans' and self.translated_blocks_cache) else self.current_ocr_data
-        if not target_blocks:
+        if self.current_text_lang == 'trans' and getattr(self, 'translated_paragraphs', None):
+            paras = self.translated_paragraphs
+            if self.current_format_mode in ('smart', 'paragraph'):
+                plain_text = '\n\n'.join(p['text'] for p in paras)
+                html_content = LayoutFormatter.to_html_paragraphs([p['text'] for p in paras])
+            elif self.current_format_mode == 'raw':
+                plain_text = '\n'.join(p['text'] for p in paras)
+                html_content = LayoutFormatter.to_html_plain(plain_text)
+            elif self.current_format_mode == 'markdown':
+                plain_text, html_content = LayoutFormatter.format_blocks(
+                    self.translated_blocks_cache,
+                    mode='markdown'
+                )
+            else:
+                plain_text = '\n\n'.join(p['text'] for p in paras)
+                html_content = LayoutFormatter.to_html_paragraphs([p['text'] for p in paras])
+
+            self.current_plain_text = plain_text
+            self.text_edit.setHtml(html_content)
+            if plain_text.strip():
+                QApplication.clipboard().setText(plain_text)
+            return
+
+        if not self.current_ocr_data:
             self.text_edit.setHtml("")
             self.text_edit.setPlaceholderText("未识别到文字 (已过滤杂讯)")
             return
 
         plain_text, html_content = LayoutFormatter.format_blocks(
-            target_blocks,
+            self.current_ocr_data,
             mode=self.current_format_mode
         )
         self.current_plain_text = plain_text
@@ -1165,30 +1336,26 @@ class ResultWindow(QWidget):
 
     def do_translate_overlay_thread(self):
         try:
-            texts_to_trans = []
-            valid_blocks = []
-            
-            for block in self.current_ocr_data:
-                txt = block.get('text', '').strip()
-                loc = block.get('location', {})
-                if txt and loc and loc.get('left') is not None:
-                    texts_to_trans.append(txt)
-                    valid_blocks.append(block)
-            
-            if not texts_to_trans:
+            paragraphs = LayoutFormatter.extract_paragraphs(self.current_ocr_data)
+            if not paragraphs:
                 self.signaler.result_ready.emit("TRANSLATE_FAILED:未检测到有效坐标文本")
                 return
 
+            texts_to_trans = [p['text'] for p in paragraphs]
             translated_results, engine_used = TranslationService.translate_texts(texts_to_trans)
 
-            self.translated_blocks_cache = []
-            for i, block in enumerate(valid_blocks):
-                trans_text = translated_results[i].strip() if i < len(translated_results) else block.get('text', '')
-                self.translated_blocks_cache.append({
-                    'location': block.get('location', {}),
-                    'text': trans_text
+            self.translated_paragraphs = []
+            for i, p in enumerate(paragraphs):
+                trans_text = translated_results[i].strip() if i < len(translated_results) else p['text']
+                self.translated_paragraphs.append({
+                    'text': trans_text,
+                    'location': p['location'],
+                    'lines': p['lines'],
+                    'avg_height': p.get('avg_height', 20),
+                    'align': p.get('align', 'left')
                 })
-            
+            self.translated_blocks_cache = self.translated_paragraphs
+
             self.signaler.result_ready.emit(f"PAINT_OVERLAY:{engine_used}")
 
         except Exception as e:
@@ -1214,11 +1381,11 @@ class ResultWindow(QWidget):
         src_image = self.current_pixmap.toImage()
         img_w, img_h = src_image.width(), src_image.height()
         
-        base_font = QFont("Microsoft YaHei", 10, QFont.Weight.Bold)
+        target_paras = getattr(self, 'translated_paragraphs', self.translated_blocks_cache)
         
-        for item in self.translated_blocks_cache:
+        for item in target_paras:
             loc = item.get('location') or item.get('rect') or {}
-            text = item.get('text', '')
+            text = item.get('text', '').strip()
             if not text:
                 continue
             
@@ -1229,42 +1396,72 @@ class ResultWindow(QWidget):
             w = max(1, r - x)
             h = max(1, b - y)
             
-            pad = 2 
-            bg_x = max(0, x - pad)
-            bg_y = max(0, y - pad)
-            bg_w = min(img_w - bg_x, w + pad * 2)
-            bg_h = min(img_h - bg_y, h + pad * 2)
-            
-            bg_rect = QRect(bg_x, bg_y, bg_w, bg_h)
-            
-            sample_x = max(0, min(img_w - 1, x - 5))
-            sample_y = max(0, min(img_h - 1, y + h // 2)) 
-            bg_color = src_image.pixelColor(sample_x, sample_y)
-            
-            painter.fillRect(bg_rect, bg_color)
-            
-            if bg_color.lightness() < 128:
-                text_color = QColor(255, 255, 255) 
+            # 多点稳定背景采样
+            sample_pts = [
+                (max(0, x - 5), max(0, min(img_h - 1, y + 4))),
+                (max(0, x - 5), max(0, min(img_h - 1, y + h // 2))),
+                (min(img_w - 1, r + 5), max(0, min(img_h - 1, y + 4))),
+                (max(0, min(img_w - 1, x + 4)), max(0, y - 5))
+            ]
+            sample_colors = [src_image.pixelColor(int(px), int(py)) for px, py in sample_pts]
+            bg_color = sample_colors[0]
+
+            pad = 3
+            lines = item.get('lines', [])
+            # 擦除原文字区域
+            if lines and len(lines) > 1:
+                for l_info in lines:
+                    lx = max(0, int(safe_float(l_info.get('left'), x)) - pad)
+                    ly = max(0, int(safe_float(l_info.get('top'), y)) - pad)
+                    lw = min(img_w - lx, int(safe_float(l_info.get('width'), w)) + pad * 2)
+                    lh = min(img_h - ly, int(safe_float(l_info.get('height'), h)) + pad * 2)
+                    painter.fillRect(QRect(lx, ly, lw, lh), bg_color)
+                # 联合区域整块覆平
+                bg_x = max(0, x - pad)
+                bg_y = max(0, y - pad)
+                bg_w = min(img_w - bg_x, w + pad * 2)
+                bg_h = min(img_h - bg_y, h + pad * 2)
+                painter.fillRect(QRect(bg_x, bg_y, bg_w, bg_h), bg_color)
             else:
-                text_color = QColor(0, 0, 0)       
+                bg_x = max(0, x - pad)
+                bg_y = max(0, y - pad)
+                bg_w = min(img_w - bg_x, w + pad * 2)
+                bg_h = min(img_h - bg_y, h + pad * 2)
+                painter.fillRect(QRect(bg_x, bg_y, bg_w, bg_h), bg_color)
+
+            # 文字颜色根据背景亮度判断
+            if bg_color.lightness() < 128:
+                text_color = QColor(255, 255, 255)
+            else:
+                text_color = QColor(25, 25, 25)
             painter.setPen(text_color)
-            
-            target_pixel_size = max(8, min(24, int(h * 0.8)))
+
+            # 动态字号计算 (基于原图行高自适应缩放)
+            orig_line_h = item.get('avg_height', h / max(1, len(lines)))
+            target_pixel_size = max(11, min(36, int(orig_line_h * 0.78)))
+            base_font = QFont("Microsoft YaHei", target_pixel_size, QFont.Weight.Medium)
             base_font.setPixelSize(target_pixel_size)
-            
+
+            draw_rect = QRect(x, y, w, h)
             fm = QFontMetrics(base_font)
-            text_width = fm.horizontalAdvance(text)
-            
-            while text_width > (w + 10) and target_pixel_size > 8:
+            flags = int(Qt.TextFlag.TextWordWrap)
+            br = fm.boundingRect(draw_rect, flags, text)
+
+            # 递减字号直到完整容纳
+            while (br.height() > h + 6 or br.width() > w + 6) and target_pixel_size > 9:
                 target_pixel_size -= 1
                 base_font.setPixelSize(target_pixel_size)
                 fm = QFontMetrics(base_font)
-                text_width = fm.horizontalAdvance(text)
-            
+                br = fm.boundingRect(draw_rect, flags, text)
+
             painter.setFont(base_font)
-            
-            draw_rect = QRect(x, y, w, h)
-            painter.drawText(draw_rect, Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, text)
+
+            if item.get('align') == 'center':
+                align_flag = Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop
+            else:
+                align_flag = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+
+            painter.drawText(draw_rect, int(align_flag | Qt.TextFlag.TextWordWrap), text)
             
         painter.end()
         self.translated_pixmap = new_pixmap
@@ -1278,7 +1475,7 @@ class ResultWindow(QWidget):
         self.trans_btn.setEnabled(True)
 
         info_str = f"({engine_info})" if engine_info else ""
-        self.tray_icon.showMessage("OCRCO", f"翻译完成 {info_str}！\n可点击按钮在【翻译图片】与【文字排版】间自由切换", QSystemTrayIcon.MessageIcon.Information, 2500)
+        self.tray_icon.showMessage("OCRCO", f"翻译完成 {info_str}！\n已按自然段落聚合完整翻译", QSystemTrayIcon.MessageIcon.Information, 2500)
 
 class ColorButton(QPushButton):
     def __init__(self, color_hex, is_selected=False, parent=None):
