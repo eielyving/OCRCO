@@ -1075,18 +1075,19 @@ class ResultWindow(QWidget):
         return exe_path, work_dir, cmd
 
     def check_autostart_status(self):
-        # 1. 优先检查启动文件夹快捷方式
-        lnk_path = self.get_startup_shortcut_path()
-        if lnk_path and os.path.exists(lnk_path):
-            return True
-        # 2. 检查注册表 Run 项
+        # 1. 优先检查注册表 Run 项（主流标准自启位置）
         try:
             key = self.get_run_key(write=False)
             winreg.QueryValueEx(key, APP_NAME)
             winreg.CloseKey(key)
             return True
         except Exception:
-            return False
+            pass
+        # 2. 备选检查启动文件夹快捷方式
+        lnk_path = self.get_startup_shortcut_path()
+        if lnk_path and os.path.exists(lnk_path):
+            return True
+        return False
 
     def toggle_autostart(self):
         is_checked = self.autostart_action.isChecked()
@@ -1094,9 +1095,23 @@ class ResultWindow(QWidget):
         exe_path, work_dir, cmd = self.get_app_paths()
 
         if is_checked:
-            # 开启开机自启（双保险：Windows启动文件夹快捷方式 + 注册表Run项）
-            # A. 启动文件夹快捷方式（最稳定可靠，免除安全软件误拦截）
-            if lnk_path:
+            # 开启开机自启：采用单通道注册规范（优先注册表 Run 项，若失败则降级到快捷方式）
+            reg_success = False
+            try:
+                key = self.get_run_key(write=True)
+                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, cmd)
+                winreg.CloseKey(key)
+                reg_success = True
+                # 注册表写入成功后，确保清理多余快捷方式，避免 Windows 设置中重复出现两个自启项
+                if lnk_path and os.path.exists(lnk_path):
+                    try:
+                        os.remove(lnk_path)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[WARN] 写入注册表自启失败，尝试回退快捷方式模式: {e}")
+
+            if not reg_success and lnk_path:
                 try:
                     ps_cmd = (
                         f"$w = New-Object -ComObject WScript.Shell;"
@@ -1117,17 +1132,9 @@ class ResultWindow(QWidget):
                 except Exception as e:
                     print(f"[WARN] 创建自启快捷方式失败: {e}")
 
-            # B. 注册表 Run 项
-            try:
-                key = self.get_run_key(write=True)
-                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, cmd)
-                winreg.CloseKey(key)
-            except Exception as e:
-                print(f"[WARN] 写入注册表自启失败: {e}")
-
             self.tray_icon.showMessage("OCRCO", "已开启开机自启动！\n（已加入 Windows 启动项）", QSystemTrayIcon.MessageIcon.Information, 1500)
         else:
-            # 关闭自启动
+            # 关闭自启动：双重清理，确保彻底注销
             if lnk_path and os.path.exists(lnk_path):
                 try:
                     os.remove(lnk_path)
