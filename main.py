@@ -105,23 +105,161 @@ class AutoScalableLabel(QLabel):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setStyleSheet("border: 2px dashed #666; background: #2b2b2b; border-radius: 10px;")
+        self.setMouseTracking(True)
         self._pixmap = None
+        self._zoom = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self._is_panning = False
+        self._last_mouse_pos = QPointF(0, 0)
+        self._show_badge = False
+        self._badge_timer = QTimer(self)
+        self._badge_timer.setSingleShot(True)
+        self._badge_timer.timeout.connect(self._hide_badge)
+
+    def _hide_badge(self):
+        self._show_badge = False
+        self.update()
 
     def set_custom_pixmap(self, pixmap):
         self._pixmap = pixmap
+        self.reset_zoom()
         self.update()
 
     def clear_canvas(self):
         self._pixmap = None
+        self.reset_zoom()
         self.update()
+
+    def reset_zoom(self):
+        self._zoom = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self._is_panning = False
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def wheelEvent(self, event):
+        if not self._pixmap or self._pixmap.isNull():
+            super().wheelEvent(event)
+            return
+
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+
+        old_zoom = self._zoom
+        factor = 1.15 if delta > 0 else (1.0 / 1.15)
+        new_zoom = max(0.5, min(8.0, old_zoom * factor))
+        if abs(new_zoom - 1.0) < 0.04:
+            new_zoom = 1.0
+
+        if new_zoom != old_zoom:
+            # 以当前鼠标位置为缩放锚点，使光标下的图像点保持稳定
+            cursor_pos = event.position()
+            cx, cy = self.width() / 2.0, self.height() / 2.0
+            
+            dx = cursor_pos.x() - cx - self._pan_x
+            dy = cursor_pos.y() - cy - self._pan_y
+            
+            scale_change = new_zoom / old_zoom
+            self._pan_x -= dx * (scale_change - 1.0)
+            self._pan_y -= dy * (scale_change - 1.0)
+            self._zoom = new_zoom
+
+            if self._zoom <= 1.01:
+                self._pan_x = 0.0
+                self._pan_y = 0.0
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+            else:
+                self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+            self._show_badge = True
+            self._badge_timer.start(1500)
+            self.update()
+
+        event.accept()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._zoom > 1.01:
+            self._is_panning = True
+            self._last_mouse_pos = event.position()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._is_panning and self._zoom > 1.01:
+            cur_pos = event.position()
+            diff = cur_pos - self._last_mouse_pos
+            self._pan_x += diff.x()
+            self._pan_y += diff.y()
+            self._last_mouse_pos = cur_pos
+            self.update()
+            event.accept()
+        else:
+            if self._zoom > 1.01 and not self._is_panning:
+                self.setCursor(Qt.CursorShape.OpenHandCursor)
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._is_panning:
+            self._is_panning = False
+            self.setCursor(Qt.CursorShape.OpenHandCursor if self._zoom > 1.01 else Qt.CursorShape.ArrowCursor)
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            # 双击快速重置缩放至 100% 适应视口
+            self.reset_zoom()
+            self._show_badge = True
+            self._badge_timer.start(1200)
+            self.update()
+            event.accept()
+        else:
+            super().mouseDoubleClickEvent(event)
 
     def paintEvent(self, event):
         painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+
         if self._pixmap and not self._pixmap.isNull():
-            scaled = self._pixmap.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            x = (self.width() - scaled.width()) // 2
-            y = (self.height() - scaled.height()) // 2
-            painter.drawPixmap(x, y, scaled)
+            base_scaled = self._pixmap.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            bw = base_scaled.width() * self._zoom
+            bh = base_scaled.height() * self._zoom
+            
+            bx = (self.width() - bw) / 2.0 + self._pan_x
+            by = (self.height() - bh) / 2.0 + self._pan_y
+
+            # 视口裁剪保护
+            painter.save()
+            painter.setClipRect(self.rect().adjusted(2, 2, -2, -2))
+            target_rect = QRectF(bx, by, bw, bh)
+            painter.drawPixmap(target_rect.toRect(), self._pixmap)
+            painter.restore()
+
+            # 缩放倍率悬浮胶囊提示
+            if self._show_badge or self._zoom > 1.01:
+                zoom_pct = int(round(self._zoom * 100))
+                hint_txt = f"🔍 {zoom_pct}% (滚轮缩放 / 拖拽平移 / 双击复原)"
+                font = QFont("Microsoft YaHei", 9, QFont.Weight.Medium)
+                painter.setFont(font)
+                fm = QFontMetrics(font)
+                tw = fm.horizontalAdvance(hint_txt) + 18
+                th = 26
+                rx = self.width() - tw - 14
+                ry = 14
+                badge_rect = QRect(int(rx), int(ry), int(tw), int(th))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(20, 20, 24, 200))
+                painter.drawRoundedRect(badge_rect, 6, 6)
+                painter.setPen(QColor(240, 240, 240))
+                painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, hint_txt)
         else:
             painter.setPen(QColor("#888888"))
             font = painter.font()
@@ -155,13 +293,20 @@ def should_merge_lines(prev_it, cur_it, avg_h):
     if not prev_txt or not cur_txt:
         return False
     # 首行缩进过大或属于独立栏目则不合并
-    if abs(cur_it['left'] - prev_it['left']) > avg_h * 2.0:
+    if abs(cur_it['left'] - prev_it['left']) > avg_h * 1.5:
         return False
     # 序号、列表符开头视为新项目
     if re.match(r'^((\d+[\.\、\)])|([一二三四五六七八九十]+[\.\、\)])|([•\-\*\+]))', cur_txt):
         return False
     # 冒号、大括号结尾通常为标题或代码结构
     if prev_txt[-1] in (':', '：', '{', '}'):
+        return False
+    # 标题/卡片标题特征保护：上一行为短小标题（如 "AIHOT", "Automate", "Canvas"），下一行为描述正文，不合并
+    prev_words = prev_txt.split()
+    if len(prev_txt) <= 25 and (len(prev_words) <= 4 or len(prev_txt) <= 10) and prev_txt[-1] not in (',', '，', '-', '—'):
+        if len(cur_txt) >= 15 or len(cur_txt.split()) >= 4:
+            return False
+    if prev_it.get('height', avg_h) > cur_it.get('height', avg_h) * 1.25:
         return False
     # 句号/问号结尾且后续行明显缩进或垂直间距较大
     if prev_txt[-1] in ('。', '！', '？', '.', '!', '?') and (cur_it['left'] - prev_it['left']) > avg_h * 0.8:
@@ -199,6 +344,45 @@ class LayoutFormatter:
             return fallback_text, cls.to_html_plain(fallback_text)
 
     @classmethod
+    def detect_column_splits(cls, items, avg_h):
+        """
+        稳健多栏/卡片分栏中轴线检测：
+        即使页面中有通栏横幅或按钮，也能通过统计学排除噪点，准确定位多栏分界线
+        """
+        if len(items) < 4:
+            return []
+        min_x = max(0.0, min(it['left'] for it in items))
+        max_x = max(min_x + 10.0, max(it['right'] for it in items))
+        if (max_x - min_x) < avg_h * 5:
+            return []
+
+        step = max(5, int(avg_h * 0.4))
+        cand_splits = []
+        for sx in range(int(min_x + avg_h * 2), int(max_x - avg_h * 2), step):
+            cross = [it for it in items if it['left'] < sx < it['right']]
+            left = [it for it in items if it['right'] <= sx]
+            right = [it for it in items if it['left'] >= sx]
+            if len(left) >= 2 and len(right) >= 2 and len(cross) <= max(1, len(items) * 0.15):
+                cand_splits.append((sx, len(cross), len(left), len(right)))
+
+        if not cand_splits:
+            return []
+
+        cand_splits.sort(key=lambda s: s[0])
+        merged_splits = []
+        g_start = cand_splits[0][0]
+        g_end = cand_splits[0][0]
+        for s in cand_splits[1:]:
+            if s[0] - g_end <= step * 2.5:
+                g_end = s[0]
+            else:
+                merged_splits.append((g_start + g_end) / 2.0)
+                g_start = s[0]
+                g_end = s[0]
+        merged_splits.append((g_start + g_end) / 2.0)
+        return merged_splits
+
+    @classmethod
     def extract_paragraphs(cls, raw_blocks):
         """
         按阅读顺序和排版结构聚合成语义完整的自然段落。
@@ -232,43 +416,8 @@ class LayoutFormatter:
         if avg_h <= 0:
             avg_h = 16.0
 
-        min_x = max(0.0, min(it['left'] for it in items))
-        max_x = max(min_x + 10.0, max(it['right'] for it in items))
-        w_span = min(20000, int(max_x) + 15)
-        occupied = [0] * max(1, w_span)
-        for it in items:
-            start_x = max(0, min(w_span - 1, int(it['left'])))
-            end_x = max(start_x, min(w_span, int(it['right'])))
-            for x in range(start_x, end_x):
-                occupied[x] += 1
-
-        gutters = []
-        in_gap = False
-        gap_start = 0
-        min_gap_width = max(8, int(avg_h * 0.5))
-        for x in range(int(min_x), min(w_span, int(max_x))):
-            if occupied[x] == 0:
-                if not in_gap:
-                    in_gap = True
-                    gap_start = x
-            else:
-                if in_gap:
-                    in_gap = False
-                    if (x - gap_start) >= min_gap_width:
-                        gutters.append((gap_start, x, (gap_start + x) / 2))
-
-        is_multi_column = False
-        split_x_list = []
-        if gutters:
-            valid_splits = []
-            for g_start, g_end, split_x in gutters:
-                left_count = sum(1 for it in items if it['right'] <= split_x)
-                right_count = sum(1 for it in items if it['left'] >= split_x)
-                if left_count >= 2 and right_count >= 2:
-                    valid_splits.append(split_x)
-            if valid_splits:
-                is_multi_column = True
-                split_x_list = valid_splits
+        split_x_list = cls.detect_column_splits(items, avg_h)
+        is_multi_column = bool(split_x_list)
 
         def build_para_obj(para_lines):
             merged = para_lines[0]['text']
@@ -370,45 +519,8 @@ class LayoutFormatter:
         if avg_h <= 0:
             avg_h = 16.0
 
-        # 1. 检测是否存在多栏/表格排版 (寻找全局贯通的纵向空隙 gutter)
-        min_x = max(0.0, min(it['left'] for it in items))
-        max_x = max(min_x + 10.0, max(it['right'] for it in items))
-        
-        w_span = min(20000, int(max_x) + 15)
-        occupied = [0] * max(1, w_span)
-        for it in items:
-            start_x = max(0, min(w_span - 1, int(it['left'])))
-            end_x = max(start_x, min(w_span, int(it['right'])))
-            for x in range(start_x, end_x):
-                occupied[x] += 1
-                
-        gutters = []
-        in_gap = False
-        gap_start = 0
-        min_gap_width = max(8, int(avg_h * 0.5))
-        for x in range(int(min_x), min(w_span, int(max_x))):
-            if occupied[x] == 0:
-                if not in_gap:
-                    in_gap = True
-                    gap_start = x
-            else:
-                if in_gap:
-                    in_gap = False
-                    if (x - gap_start) >= min_gap_width:
-                        gutters.append((gap_start, x, (gap_start + x) / 2))
-
-        is_multi_column = False
-        split_x_list = []
-        if gutters:
-            valid_splits = []
-            for g_start, g_end, split_x in gutters:
-                left_count = sum(1 for it in items if it['right'] <= split_x)
-                right_count = sum(1 for it in items if it['left'] >= split_x)
-                if left_count >= 2 and right_count >= 2:
-                    valid_splits.append(split_x)
-            if valid_splits:
-                is_multi_column = True
-                split_x_list = valid_splits
+        split_x_list = cls.detect_column_splits(items, avg_h)
+        is_multi_column = bool(split_x_list)
 
         if is_multi_column and mode in ('smart', 'markdown'):
             num_cols = len(split_x_list) + 1
@@ -580,17 +692,34 @@ class TranslationService:
         return None
 
     @classmethod
-    def translate_google_chrome(cls, text, to_lang='zh-CN'):
+    def translate_google_chrome_batch(cls, items, to_lang='zh-CN'):
+        if not items:
+            return []
         url = 'https://clients5.google.com/translate_a/t'
         params = {'client': 'dict-chrome-ex', 'sl': 'auto', 'tl': to_lang}
-        r = requests.post(url, params=params, data={'q': text}, headers=cls.HEADERS, timeout=4)
+        data = [('q', it) for it in items]
+        r = requests.post(url, params=params, data=data, headers=cls.HEADERS, timeout=6)
         if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, list) and len(data) > 0:
-                if isinstance(data[0], list):
-                    return data[0][0]
-                return data[0]
+            data_res = r.json()
+            if isinstance(data_res, list):
+                results = []
+                for idx, entry in enumerate(data_res):
+                    if isinstance(entry, list) and len(entry) > 0:
+                        results.append(str(entry[0]))
+                    elif isinstance(entry, str):
+                        results.append(entry)
+                    else:
+                        results.append(items[idx])
+                if len(results) == len(items):
+                    return results
         raise Exception(f'Google Chrome API code {r.status_code}')
+
+    @classmethod
+    def translate_google_chrome(cls, text, to_lang='zh-CN'):
+        res = cls.translate_google_chrome_batch([text], to_lang)
+        if res:
+            return res[0]
+        raise Exception('Google Chrome API failed')
 
     @classmethod
     def translate_google_gtx(cls, text, to_lang='zh-CN'):
@@ -623,7 +752,6 @@ class TranslationService:
         target_name = 'Simplified Chinese' if to_lang == 'zh-CN' else 'English'
         prompt = (
             f"Translate the following text into {target_name}. "
-            "Preserve line breaks and separators ' ||| '. "
             "Output ONLY the direct translation, without any explanation, markdown formatting or quotes:\n\n"
             f"{text}"
         )
@@ -639,76 +767,50 @@ class TranslationService:
 
     @classmethod
     def _translate_chunk(cls, chunk, to_lang):
-        joint_text = ' ||| '.join(chunk)
         online = cls.is_online(timeout=0.8)
-        engine_used = ''
-        translated_str = ''
 
-        # 1. 在线通道优先尝试
+        # 1. 在线首选：Google Chrome 扩展原生多参数批处理（每项独立语种识别，零断隔符损耗）
         if online:
+            try:
+                results = cls.translate_google_chrome_batch(chunk, to_lang)
+                if results and len(results) == len(chunk):
+                    return results, 'Google Chrome'
+            except Exception:
+                pass
+
+        # 2. 备用通道：并发独立请求翻译（彻底杜绝 ||| 丢失或断句污染）
+        if online:
+            from concurrent.futures import ThreadPoolExecutor
             for engine_name, engine_func in [
-                ('Google Chrome', cls.translate_google_chrome),
                 ('Google GTX', cls.translate_google_gtx),
                 ('MyMemory', cls.translate_mymemory)
             ]:
                 try:
-                    translated_str = engine_func(joint_text, to_lang)
-                    if translated_str:
-                        engine_used = engine_name
-                        break
+                    with ThreadPoolExecutor(max_workers=min(6, len(chunk))) as executor:
+                        futures = [executor.submit(engine_func, item, to_lang) for item in chunk]
+                        results = [f.result(timeout=5) for f in futures]
+                    if results and len(results) == len(chunk):
+                        return results, engine_name
                 except Exception:
                     continue
 
-        # 2. 离线/在线失败时，自动调度本地 Ollama 模型
-        if not translated_str:
-            try:
-                ollama_model = cls.get_ollama_model()
-                if ollama_model:
-                    translated_str = cls.translate_ollama(joint_text, to_lang, ollama_model)
-                    engine_used = f'本地离线大模型 ({ollama_model})'
-            except Exception:
-                pass
+        # 3. 离线/在线失败时，调度本地 Ollama
+        try:
+            ollama_model = cls.get_ollama_model()
+            if ollama_model:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=min(2, len(chunk))) as executor:
+                    futures = [executor.submit(cls.translate_ollama, item, to_lang, ollama_model) for item in chunk]
+                    results = [f.result(timeout=15) for f in futures]
+                if results and len(results) == len(chunk):
+                    return results, f'本地离线大模型 ({ollama_model})'
+        except Exception:
+            pass
 
-        if not translated_str:
-            if not online:
-                raise Exception('网络已断开（离线模式），且未检测到运行中的本地 Ollama 模型。\n已为您保留原始识别文字。')
-            else:
-                raise Exception('在线翻译接口均受限/超时(429)，且本地未启动 Ollama 模型。\n已为您保留原始识别文字。')
-
-        parts = [p.strip() for p in re.split(r'\s*\|\|\|\s*', translated_str)]
-        if len(parts) != len(chunk) and len(chunk) > 1:
-            results = []
-            for item in chunk:
-                item_str = ''
-                if online:
-                    for engine_name, engine_func in [
-                        ('Google Chrome', cls.translate_google_chrome),
-                        ('Google GTX', cls.translate_google_gtx),
-                        ('MyMemory', cls.translate_mymemory)
-                    ]:
-                        try:
-                            item_str = engine_func(item, to_lang)
-                            if item_str:
-                                break
-                        except Exception:
-                            continue
-                if not item_str:
-                    try:
-                        ollama_model = cls.get_ollama_model()
-                        if ollama_model:
-                            item_str = cls.translate_ollama(item, to_lang, ollama_model)
-                    except Exception:
-                        pass
-                results.append(item_str.strip() if item_str else item)
-            return results, engine_used
-
-        results = []
-        for i in range(len(chunk)):
-            if i < len(parts) and parts[i]:
-                results.append(parts[i])
-            else:
-                results.append(chunk[i])
-        return results, engine_used
+        if not online:
+            raise Exception('网络已断开（离线模式），且未检测到运行中的本地 Ollama 模型。\n已为您保留原始识别文字。')
+        else:
+            raise Exception('在线翻译接口均受限/超时(429)，且本地未启动 Ollama 模型。\n已为您保留原始识别文字。')
 
     @classmethod
     def translate_texts(cls, texts, to_lang=None):
@@ -721,7 +823,7 @@ class TranslationService:
             total_alpha = len(re.findall(r'[a-zA-Z\u4e00-\u9fa5]', joint_source))
             to_lang = 'en' if (total_alpha > 0 and (chinese_chars / total_alpha) > 0.4) else 'zh-CN'
 
-        batch_size = 25
+        batch_size = 40
         all_results = []
         last_engine = ''
 
@@ -1413,7 +1515,7 @@ class ResultWindow(QWidget):
             sample_colors = [src_image.pixelColor(int(px), int(py)) for px, py in sample_pts]
             bg_color = sample_colors[0]
 
-            pad = 3
+            pad = 1
             lines = item.get('lines', [])
             # 擦除原文字区域
             if lines and len(lines) > 1:
@@ -1445,7 +1547,7 @@ class ResultWindow(QWidget):
 
             # 动态字号计算 (基于原图行高自适应缩放)
             orig_line_h = item.get('avg_height', h / max(1, len(lines)))
-            target_pixel_size = max(11, min(36, int(orig_line_h * 0.78)))
+            target_pixel_size = max(11, min(36, int(orig_line_h * 0.82)))
             base_font = QFont("Microsoft YaHei", target_pixel_size, QFont.Weight.Medium)
             base_font.setPixelSize(target_pixel_size)
 
@@ -1454,8 +1556,9 @@ class ResultWindow(QWidget):
             flags = int(Qt.TextFlag.TextWordWrap)
             br = fm.boundingRect(draw_rect, flags, text)
 
-            # 递减字号直到完整容纳
-            while (br.height() > h + 6 or br.width() > w + 6) and target_pixel_size > 9:
+            # 递减字号直到完整容纳，最低保持 11px 清晰度
+            max_allowed_h = int(h + max(8.0, orig_line_h * 0.5))
+            while (br.height() > max_allowed_h or br.width() > w + 6) and target_pixel_size > 11:
                 target_pixel_size -= 1
                 base_font.setPixelSize(target_pixel_size)
                 fm = QFontMetrics(base_font)
@@ -1574,11 +1677,25 @@ class ScreenshotToolbar(QWidget):
                 background: #07C160;
                 color: #FFFFFF;
                 font-weight: bold;
-                padding: 4px 10px;
+                padding: 4px 12px;
                 border-radius: 4px;
+                font-size: 13px;
+                border: 1px solid #06AD56;
             }
             QPushButton#ocrBtn:hover {
                 background: #09D66A;
+            }
+            QPushButton#copyBtn {
+                background: #1890FF;
+                color: #FFFFFF;
+                font-weight: bold;
+                padding: 4px 12px;
+                border-radius: 4px;
+                font-size: 13px;
+                border: 1px solid #096DD9;
+            }
+            QPushButton#copyBtn:hover {
+                background: #40A9FF;
             }
             QFrame.sep {
                 background-color: rgba(255, 255, 255, 0.2);
@@ -1592,15 +1709,11 @@ class ScreenshotToolbar(QWidget):
         row1 = QWidget()
         r1_layout = QHBoxLayout(row1)
         r1_layout.setContentsMargins(0, 0, 0, 0)
-        r1_layout.setSpacing(3)
+        r1_layout.setSpacing(4)
         
         self.tool_buttons = {}
         tool_defs = [
-            ('rect', '🔲 矩形', '矩形框选标注'),
-            ('ellipse', '⭕ 椭圆', '椭圆标注'),
-            ('arrow', '↗ 箭头', '箭头标注'),
-            ('pen', '✏️ 涂鸦', '画笔自由涂鸦'),
-            ('text', '🔤 文字', '添加文字说明')
+            ('arrow', '↗ 箭头', '箭头标注 (拖拽绘制)')
         ]
         
         for key, name, tip in tool_defs:
@@ -1624,17 +1737,23 @@ class ScreenshotToolbar(QWidget):
         sep.setFixedWidth(1)
         r1_layout.addWidget(sep)
         
-        self.ocr_btn = QPushButton('🔍 识别')
+        self.ocr_btn = QPushButton('🔍 识别文字 (Ctrl)')
         self.ocr_btn.setObjectName('ocrBtn')
-        self.ocr_btn.setToolTip('完成并进行 OCR 文字识别 (Enter)')
+        self.ocr_btn.setToolTip('提取图片文字并打开排版/翻译面板 (快捷键: 单按Ctrl / 回车 / 双击选区)')
         self.ocr_btn.clicked.connect(self.ocr_clicked.emit)
         r1_layout.addWidget(self.ocr_btn)
         
-        self.copy_btn = QPushButton('📋 复制')
-        self.copy_btn.setProperty('class', 'actionBtn')
-        self.copy_btn.setToolTip('复制截图到剪贴板 (Ctrl+C)')
+        self.copy_btn = QPushButton('📋 复制图片 (空格)')
+        self.copy_btn.setObjectName('copyBtn')
+        self.copy_btn.setToolTip('直接复制截图图片到剪贴板并退出 (快捷键: 空格键 / Ctrl+C)')
         self.copy_btn.clicked.connect(self.copy_clicked.emit)
         r1_layout.addWidget(self.copy_btn)
+        
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.VLine)
+        sep2.setProperty('class', 'sep')
+        sep2.setFixedWidth(1)
+        r1_layout.addWidget(sep2)
         
         self.save_btn = QPushButton('💾 保存')
         self.save_btn.setProperty('class', 'actionBtn')
@@ -2131,7 +2250,7 @@ class ScreenshotSelector(QWidget):
         painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, text)
 
     def draw_top_hint(self, painter):
-        text = "🖱️ 移动鼠标自动框选 / 拖拽自定义选区 | 单击自动吸附 | 右键或 Esc 退出"
+        text = "🖱️ 鼠标框选 | 空格键: 复制图片 | Ctrl / 回车 / 双击: 识别文字 | ↗ 箭头标注 | Esc: 退出"
         font = QFont("Microsoft YaHei", 10)
         painter.setFont(font)
         fm = QFontMetrics(font)
@@ -2472,20 +2591,67 @@ class ScreenshotSelector(QWidget):
                 self.update()
             else:
                 self.close_and_clear()
-                
-        elif event.key() == Qt.Key.Key_Z and (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
-            self.undo_annotation()
-            
-        elif event.key() == Qt.Key.Key_C and (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+
+        elif event.key() == Qt.Key.Key_Space:
+            # 【用户快捷操作】：按空格直接复制图片并退出
             if self.state == 'SELECTED':
                 self.copy_to_clipboard()
-                
+            elif self.state == 'HOVER' and self.hover_rect and not self.hover_rect.isNull():
+                self.selected_rect = self.hover_rect
+                self.copy_to_clipboard()
+
+        elif event.key() == Qt.Key.Key_Control:
+            self._ctrl_only_pressed = True
+
+        elif event.key() == Qt.Key.Key_Z and (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            self._ctrl_only_pressed = False
+            self.undo_annotation()
+
+        elif event.key() == Qt.Key.Key_C and (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            self._ctrl_only_pressed = False
+            if self.state == 'SELECTED':
+                self.copy_to_clipboard()
+            elif self.state == 'HOVER' and self.hover_rect and not self.hover_rect.isNull():
+                self.selected_rect = self.hover_rect
+                self.copy_to_clipboard()
+
         elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._ctrl_only_pressed = False
             if self.state == 'SELECTED' and not self.text_editor.hasFocus():
                 self.commit_ocr()
-                
+            elif self.state == 'HOVER' and self.hover_rect and not self.hover_rect.isNull():
+                self.selected_rect = self.hover_rect
+                self.commit_ocr()
+
         else:
+            self._ctrl_only_pressed = False
             super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() == Qt.Key.Key_Control and getattr(self, '_ctrl_only_pressed', False):
+            self._ctrl_only_pressed = False
+            # 【用户快捷操作】：单按 Ctrl 键直接触发识别文字并弹出面板
+            if self.state == 'SELECTED':
+                self.commit_ocr()
+            elif self.state == 'HOVER' and self.hover_rect and not self.hover_rect.isNull():
+                self.selected_rect = self.hover_rect
+                self.commit_ocr()
+        else:
+            super().keyReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            # 【用户双击快捷操作】：双击选区直接进入识别文字
+            if self.state == 'SELECTED' and self.selected_rect and self.selected_rect.contains(event.pos()):
+                self.commit_ocr()
+                event.accept()
+                return
+            elif self.state == 'HOVER' and self.hover_rect and self.hover_rect.contains(event.pos()):
+                self.selected_rect = self.hover_rect
+                self.commit_ocr()
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
 
     def on_tool_changed(self, tool):
         if self.text_editor.isVisible():
