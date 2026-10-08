@@ -11,9 +11,12 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
-    noarchive=False,
     optimize=0,
 )
+
+# 排除第三方应用中残留的 icu 动态库，强制由 Windows 系统原生提供，彻底解决 QtWidgets WinError 127
+a.binaries = [x for x in a.binaries if not x[0].lower().startswith('icu')]
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
