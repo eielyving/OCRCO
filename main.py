@@ -12,15 +12,32 @@ import socket
 import urllib.parse
 from ctypes import wintypes
 import math
+from datetime import datetime
+import traceback
 import numpy as np
 import cv2
 from PyQt6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout, QLabel, 
                              QTextEdit, QPushButton, QMessageBox, QSystemTrayIcon, QMenu, 
                              QStyle, QSizePolicy, QFrame, QLineEdit, QFileDialog, QButtonGroup)
-from PyQt6.QtCore import Qt, QRect, QPoint, QPointF, pyqtSignal, QObject, QSize, QTimer, QAbstractNativeEventFilter
+from PyQt6.QtCore import Qt, QRect, QRectF, QPoint, QPointF, pyqtSignal, QObject, QSize, QTimer, QAbstractNativeEventFilter
 from PyQt6.QtGui import (QPainter, QColor, QPen, QGuiApplication, QIcon, QAction, QFont, 
                         QPixmap, QFontMetrics, QImage, QPolygonF, QBrush, QCursor)
 from wechat_ocr.ocr_manager import OcrManager
+
+# --- 全局异常日志记录，确保任何崩溃均输出至 crash.log ---
+def global_exception_logger(exctype, value, tb):
+    err = "".join(traceback.format_exception(exctype, value, tb))
+    print(f"[FATAL EXCEPTION] {err}", file=sys.stderr)
+    try:
+        log_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+        log_file = os.path.join(log_dir, "crash.log")
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] CRASH:\n{err}\n")
+    except Exception:
+        pass
+    sys.__excepthook__(exctype, value, tb)
+
+sys.excepthook = global_exception_logger
 
 # --- Windows API 设置 ---
 user32 = ctypes.windll.user32
@@ -224,48 +241,51 @@ class AutoScalableLabel(QLabel):
             super().mouseDoubleClickEvent(event)
 
     def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        try:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
-        if self._pixmap and not self._pixmap.isNull():
-            base_scaled = self._pixmap.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            bw = base_scaled.width() * self._zoom
-            bh = base_scaled.height() * self._zoom
-            
-            bx = (self.width() - bw) / 2.0 + self._pan_x
-            by = (self.height() - bh) / 2.0 + self._pan_y
+            if self._pixmap and not self._pixmap.isNull():
+                base_scaled = self._pixmap.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                bw = base_scaled.width() * self._zoom
+                bh = base_scaled.height() * self._zoom
+                
+                bx = (self.width() - bw) / 2.0 + self._pan_x
+                by = (self.height() - bh) / 2.0 + self._pan_y
 
-            # 视口裁剪保护
-            painter.save()
-            painter.setClipRect(self.rect().adjusted(2, 2, -2, -2))
-            target_rect = QRectF(bx, by, bw, bh)
-            painter.drawPixmap(target_rect.toRect(), self._pixmap)
-            painter.restore()
+                # 视口裁剪保护
+                painter.save()
+                painter.setClipRect(self.rect().adjusted(2, 2, -2, -2))
+                target_rect = QRect(int(round(bx)), int(round(by)), int(round(bw)), int(round(bh)))
+                painter.drawPixmap(target_rect, self._pixmap)
+                painter.restore()
 
-            # 缩放倍率悬浮胶囊提示
-            if self._show_badge or self._zoom > 1.01:
-                zoom_pct = int(round(self._zoom * 100))
-                hint_txt = f"🔍 {zoom_pct}% (滚轮缩放 / 拖拽平移 / 双击复原)"
-                font = QFont("Microsoft YaHei", 9, QFont.Weight.Medium)
+                # 缩放倍率悬浮胶囊提示
+                if self._show_badge or self._zoom > 1.01:
+                    zoom_pct = int(round(self._zoom * 100))
+                    hint_txt = f"🔍 {zoom_pct}% (滚轮缩放 / 拖拽平移 / 双击复原)"
+                    font = QFont("Microsoft YaHei", 9, QFont.Weight.Medium)
+                    painter.setFont(font)
+                    fm = QFontMetrics(font)
+                    tw = fm.horizontalAdvance(hint_txt) + 18
+                    th = 26
+                    rx = self.width() - tw - 14
+                    ry = 14
+                    badge_rect = QRect(int(rx), int(ry), int(tw), int(th))
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(QColor(20, 20, 24, 200))
+                    painter.drawRoundedRect(badge_rect, 6, 6)
+                    painter.setPen(QColor(240, 240, 240))
+                    painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, hint_txt)
+            else:
+                painter.setPen(QColor("#888888"))
+                font = painter.font()
+                font.setPointSize(14)
                 painter.setFont(font)
-                fm = QFontMetrics(font)
-                tw = fm.horizontalAdvance(hint_txt) + 18
-                th = 26
-                rx = self.width() - tw - 14
-                ry = 14
-                badge_rect = QRect(int(rx), int(ry), int(tw), int(th))
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QColor(20, 20, 24, 200))
-                painter.drawRoundedRect(badge_rect, 6, 6)
-                painter.setPen(QColor(240, 240, 240))
-                painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, hint_txt)
-        else:
-            painter.setPen(QColor("#888888"))
-            font = painter.font()
-            font.setPointSize(14)
-            painter.setFont(font)
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "截图预览\n(Light Mode)")
+                painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "截图预览\n(Light Mode)")
+        except Exception as e:
+            print(f"[ERROR] AutoScalableLabel.paintEvent: {e}")
 
 def is_cjk(ch):
     return '\u4e00' <= ch <= '\u9fff'
@@ -1310,18 +1330,22 @@ class ResultWindow(QWidget):
             self.signaler.result_ready.emit(f"解析错误: {e}")
 
     def update_ui_with_result(self, text):
-        if text == "APPLY_FORMAT":
-            self.apply_current_format()
-            return
-        elif text.startswith("PAINT_OVERLAY"):
-            engine_info = text.split(":", 1)[1] if ":" in text else ""
-            self.paint_translation_overlay(engine_info)
-            return
-        elif text.startswith("TRANSLATE_FAILED:"):
-            error_msg = text.split(":", 1)[1]
-            self.handle_translation_failed(error_msg)
-            return
-        self.update_text(text)
+        try:
+            if text == "APPLY_FORMAT":
+                self.apply_current_format()
+                return
+            elif text.startswith("PAINT_OVERLAY"):
+                engine_info = text.split(":", 1)[1] if ":" in text else ""
+                self.paint_translation_overlay(engine_info)
+                return
+            elif text.startswith("TRANSLATE_FAILED:"):
+                error_msg = text.split(":", 1)[1]
+                self.handle_translation_failed(error_msg)
+                return
+            self.update_text(text)
+        except Exception as e:
+            print(f"[ERROR] update_ui_with_result error: {e}")
+            traceback.print_exc()
 
     def switch_format_mode(self, mode):
         self.current_format_mode = mode
