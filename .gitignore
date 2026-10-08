@@ -5,8 +5,6 @@ __pycache__/
 # 打包生成的临时文件和成品
 build/
 dist/
-*.spec
-# 注意：如果你想保留 .spec 配置，就把上面这行 *.spec 删掉，我建议你保留
 
 # 临时图片
 temp_ocr.png
