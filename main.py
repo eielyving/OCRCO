@@ -769,10 +769,11 @@ class TranslationService:
         if not model:
             raise Exception('未检测到本地 Ollama 模型')
         
-        target_name = 'Simplified Chinese' if to_lang == 'zh-CN' else 'English'
+        target_name = 'Simplified Chinese (简体中文)' if to_lang == 'zh-CN' else 'English'
         prompt = (
-            f"Translate the following text into {target_name}. "
-            "Output ONLY the direct translation, without any explanation, markdown formatting or quotes:\n\n"
+            f"You are a professional translator. Translate the following text into {target_name}.\n"
+            "If any portion of the text is already in the target language, keep it natural and preserve it.\n"
+            "Output ONLY the direct translation content, with no explanations, notes, markdown formatting or quotes:\n\n"
             f"{text}"
         )
         r = requests.post('http://127.0.0.1:11434/api/generate', json={
@@ -833,15 +834,12 @@ class TranslationService:
             raise Exception('在线翻译接口均受限/超时(429)，且本地未启动 Ollama 模型。\n已为您保留原始识别文字。')
 
     @classmethod
-    def translate_texts(cls, texts, to_lang=None):
+    def translate_texts(cls, texts, to_lang='zh-CN'):
         if not texts:
             return [], '空文本'
         
-        joint_source = ' '.join(texts)
         if not to_lang:
-            chinese_chars = len(re.findall(r'[\u4e00-\u9fa5]', joint_source))
-            total_alpha = len(re.findall(r'[a-zA-Z\u4e00-\u9fa5]', joint_source))
-            to_lang = 'en' if (total_alpha > 0 and (chinese_chars / total_alpha) > 0.4) else 'zh-CN'
+            to_lang = 'zh-CN'
 
         batch_size = 40
         all_results = []
@@ -907,6 +905,7 @@ class ResultWindow(QWidget):
         self.translated_blocks_cache = []
         self.current_text_lang = 'source'
         self.translated_pixmap = None
+        self.target_lang = 'zh-CN'
         self.setup_ui()
         self.current_pixmap = None
         self.current_ocr_data = [] 
@@ -1000,6 +999,19 @@ class ResultWindow(QWidget):
                 color: rgba(255, 255, 255, 0.25);
                 border-color: rgba(255, 255, 255, 0.1);
             }
+            QPushButton.langToggleBtn {
+                background-color: rgba(255, 255, 255, 0.18);
+                border: 1px solid rgba(255, 255, 255, 0.28);
+                border-radius: 6px;
+                color: #ffffff;
+                font-size: 13px;
+                padding: 6px 12px;
+                font-weight: bold;
+            }
+            QPushButton.langToggleBtn:hover {
+                background-color: rgba(255, 255, 255, 0.35);
+                border-color: rgba(255, 255, 255, 0.5);
+            }
             QPushButton#copyTextBtn {
                 background-color: #07c160;
                 border: none;
@@ -1025,7 +1037,7 @@ class ResultWindow(QWidget):
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(10)
 
-        # 排版模式切换栏
+        # 排版模式与语言控制栏 (精简瘦身版)
         mode_container = QWidget()
         mode_layout = QHBoxLayout(mode_container)
         mode_layout.setContentsMargins(0, 0, 0, 0)
@@ -1038,31 +1050,17 @@ class ResultWindow(QWidget):
         self.btn_mode_smart.setProperty("class", "modeBtn")
         self.btn_mode_smart.setCheckable(True)
         self.btn_mode_smart.setChecked(True)
-        self.btn_mode_smart.setToolTip("自动识别多栏与表格，智能合并跨行文字 (默认)")
+        self.btn_mode_smart.setToolTip("自动识别段落与多栏，智能合并跨行文字 (默认)")
         self.btn_mode_smart.clicked.connect(lambda: self.switch_format_mode('smart'))
-
-        self.btn_mode_para = QPushButton("📃 自然段落")
-        self.btn_mode_para.setProperty("class", "modeBtn")
-        self.btn_mode_para.setCheckable(True)
-        self.btn_mode_para.setToolTip("合并换行硬回车，还原连贯自然段落")
-        self.btn_mode_para.clicked.connect(lambda: self.switch_format_mode('paragraph'))
 
         self.btn_mode_raw = QPushButton("📄 逐行原始")
         self.btn_mode_raw.setProperty("class", "modeBtn")
         self.btn_mode_raw.setCheckable(True)
-        self.btn_mode_raw.setToolTip("保留 OCR 检测的原始单行分行")
+        self.btn_mode_raw.setToolTip("保留 OCR 检测的原始单行分行 (适合复制单行代码/诗句)")
         self.btn_mode_raw.clicked.connect(lambda: self.switch_format_mode('raw'))
 
-        self.btn_mode_md = QPushButton("📊 表格Markdown")
-        self.btn_mode_md.setProperty("class", "modeBtn")
-        self.btn_mode_md.setCheckable(True)
-        self.btn_mode_md.setToolTip("将多栏表格转换为 Markdown 表格格式")
-        self.btn_mode_md.clicked.connect(lambda: self.switch_format_mode('markdown'))
-
         self.mode_group.addButton(self.btn_mode_smart)
-        self.mode_group.addButton(self.btn_mode_para)
         self.mode_group.addButton(self.btn_mode_raw)
-        self.mode_group.addButton(self.btn_mode_md)
 
         self.view_lang_group = QButtonGroup(self)
         self.view_lang_group.setExclusive(True)
@@ -1084,13 +1082,18 @@ class ResultWindow(QWidget):
         self.view_lang_group.addButton(self.btn_lang_src)
         self.view_lang_group.addButton(self.btn_lang_trans)
 
+        self.btn_target_lang = QPushButton("🇨🇳 译为中文")
+        self.btn_target_lang.setProperty("class", "langToggleBtn")
+        self.btn_target_lang.setToolTip("点击切换翻译目标语言 (当前: 译为中文)")
+        self.btn_target_lang.clicked.connect(self.toggle_target_lang)
+
         mode_layout.addWidget(self.btn_mode_smart)
-        mode_layout.addWidget(self.btn_mode_para)
         mode_layout.addWidget(self.btn_mode_raw)
-        mode_layout.addWidget(self.btn_mode_md)
-        mode_layout.addSpacing(6)
+        mode_layout.addSpacing(10)
         mode_layout.addWidget(self.btn_lang_src)
         mode_layout.addWidget(self.btn_lang_trans)
+        mode_layout.addSpacing(10)
+        mode_layout.addWidget(self.btn_target_lang)
         mode_layout.addStretch()
 
         self.copy_text_btn = QPushButton("📋 复制文字")
@@ -1151,6 +1154,10 @@ class ResultWindow(QWidget):
         self.translated_blocks_cache = []
         self.translated_pixmap = None
         self.current_text_lang = 'source'
+        self.target_lang = 'zh-CN'
+        if hasattr(self, 'btn_target_lang'):
+            self.btn_target_lang.setText("🇨🇳 译为中文")
+            self.btn_target_lang.setToolTip("点击切换翻译目标语言 (当前: 译为中文)")
         if hasattr(self, 'btn_lang_src'):
             self.btn_lang_src.setChecked(True)
             self.btn_lang_trans.setEnabled(False)
@@ -1365,6 +1372,30 @@ class ResultWindow(QWidget):
                 self.trans_btn.setText("🌐 查看翻译图片")
         self.apply_current_format()
 
+    def toggle_target_lang(self):
+        if self.target_lang == 'zh-CN':
+            self.target_lang = 'en'
+            self.btn_target_lang.setText("🇬🇧 译为英文")
+            self.btn_target_lang.setToolTip("点击切换翻译目标语言 (当前: 译为英文)")
+            self.tray_icon.showMessage("OCRCO", "翻译目标已切换为：英文", QSystemTrayIcon.MessageIcon.Information, 800)
+        else:
+            self.target_lang = 'zh-CN'
+            self.btn_target_lang.setText("🇨🇳 译为中文")
+            self.btn_target_lang.setToolTip("点击切换翻译目标语言 (当前: 译为中文)")
+            self.tray_icon.showMessage("OCRCO", "翻译目标已切换为：中文", QSystemTrayIcon.MessageIcon.Information, 800)
+        
+        # 若已有翻译结果，自动以新目标语言重新翻译
+        if self.has_translation and self.current_ocr_data:
+            self.has_translation = False
+            self.translated_blocks_cache = []
+            self.translated_pixmap = None
+            self.trans_image_label.clear_canvas()
+            self.trans_image_label.hide()
+            self.text_edit.show()
+            self.btn_lang_src.setChecked(True)
+            self.btn_lang_trans.setEnabled(False)
+            self.translate_overlay_action()
+
     def apply_current_format(self):
         if self.current_text_lang == 'trans' and getattr(self, 'translated_paragraphs', None):
             paras = self.translated_paragraphs
@@ -1475,7 +1506,7 @@ class ResultWindow(QWidget):
                 return
 
             texts_to_trans = [p['text'] for p in paragraphs]
-            translated_results, engine_used = TranslationService.translate_texts(texts_to_trans)
+            translated_results, engine_used = TranslationService.translate_texts(texts_to_trans, to_lang=self.target_lang)
 
             self.translated_paragraphs = []
             for i, p in enumerate(paragraphs):
@@ -1609,7 +1640,8 @@ class ResultWindow(QWidget):
         self.trans_btn.setEnabled(True)
 
         info_str = f"({engine_info})" if engine_info else ""
-        self.tray_icon.showMessage("OCRCO", f"翻译完成 {info_str}！\n已按自然段落聚合完整翻译", QSystemTrayIcon.MessageIcon.Information, 2500)
+        target_str = "中文" if self.target_lang == 'zh-CN' else "英文"
+        self.tray_icon.showMessage("OCRCO", f"翻译完成 {info_str}！\n已译为{target_str}并按自然段落聚合", QSystemTrayIcon.MessageIcon.Information, 2500)
 
 class ColorButton(QPushButton):
     def __init__(self, color_hex, is_selected=False, parent=None):

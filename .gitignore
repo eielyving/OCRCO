@@ -20,3 +20,6 @@ temp_ocr.png
 
 # 备份文件
 *.bak
+
+# 崩溃日志
+crash.log
